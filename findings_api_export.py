@@ -15,7 +15,7 @@ FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/finding
 
 DEFAULT_PAGE_SIZE = 500
 
-# SCA must be fetched in a separate API call; cannot be mixed with other scan types
+# SCA must be fetched in a separate API call
 NON_SCA_SCAN_TYPES = ["STATIC", "DYNAMIC", "MANUAL"]
 
 
@@ -30,7 +30,7 @@ def parse_args():
     )
     parser.add_argument(
         "--app-name",
-        help="Filter by specific application name (optional).",
+        help="Filter by specific application name(s). Supports comma-separated values for multiple apps (optional).",
     )
     parser.add_argument(
         "--app-guid",
@@ -514,11 +514,17 @@ def main():
         applications = get_applications(session, args.sleep)
 
         if args.app_name:
+            # Parse comma-separated app names
+            target_app_names = [name.strip() for name in args.app_name.split(",")]
             applications = [
                 app for app in applications
-                if args.app_name.lower() in app.get("profile", {}).get("name", "").lower()
+                if app.get("profile", {}).get("name", "") in target_app_names
             ]
-            print(f"Filtered to {len(applications)} applications matching '{args.app_name}'\n")
+            print(f"Filtered to {len(applications)} applications matching provided names\n")
+            if len(applications) < len(target_app_names):
+                found_names = {app.get("profile", {}).get("name", "") for app in applications}
+                missing_names = set(target_app_names) - found_names
+                print(f"WARNING: Could not find the following applications: {', '.join(missing_names)}\n")
 
         if args.max_apps:
             applications = applications[: args.max_apps]
