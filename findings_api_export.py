@@ -8,19 +8,21 @@ import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 
 
-# API Base URLs
 BASE_URL = "https://api.veracode.com"
 APPLICATIONS_URL = f"{BASE_URL}/appsec/v1/applications"
+SANDBOXES_URL_TEMPLATE = f"{BASE_URL}/appsec/v1/applications/{{app_guid}}/sandboxes"
 FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/findings"
 
-DEFAULT_PAGE_SIZE = 500  # Maximum page size for findings API
+DEFAULT_PAGE_SIZE = 500
+
+# SCA must be fetched in a separate API call
+NON_SCA_SCAN_TYPES = ["STATIC", "DYNAMIC", "MANUAL"]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Export Veracode FINDINGS data via Findings REST API (per application)."
     )
-    
     parser.add_argument(
         "--output",
         default="veracode_findings_api.csv",
@@ -57,6 +59,13 @@ def parse_args():
         help="Filter by finding status: OPEN or CLOSED.",
     )
     parser.add_argument(
+        "--include-sandbox",
+        action="store_true",
+        default=False,
+        help="Also fetch findings from all development sandboxes. "
+             "By default only policy scan findings are returned.",
+    )
+    parser.add_argument(
         "--sleep",
         type=float,
         default=0.5,
@@ -71,68 +80,98 @@ def parse_args():
 
 
 def get_applications(session, sleep_time=0.5):
-    """
-    Fetch all applications using pagination.
-    Returns a list of application objects with guid and profile.name.
-    """
+    """Fetch all applications using pagination."""
     print("\n" + "=" * 70)
     print("  FETCHING APPLICATIONS")
     print("=" * 70)
-    
+
     all_apps = []
     page = 0
-    
+
     while True:
         print(f"  Fetching applications page {page}...")
-        
         resp = session.get(
             APPLICATIONS_URL,
             params={"page": page, "size": 500},
             auth=RequestsAuthPluginVeracodeHMAC(),
             timeout=60,
         )
-        
+
         if resp.status_code != 200:
             print(f"  ERROR: Status {resp.status_code}")
             print(f"  Response: {resp.text}")
             resp.raise_for_status()
-        
+
         data = resp.json()
-        
-        embedded = data.get("_embedded", {})
-        applications = embedded.get("applications", [])
-        
+        applications = data.get("_embedded", {}).get("applications", [])
+
         if not applications:
             break
-        
+
         all_apps.extend(applications)
         print(f"  Page {page}: {len(applications)} applications (Total: {len(all_apps)})")
-        
-        links = data.get("_links", {})
-        if not links.get("next"):
+
+        if not data.get("_links", {}).get("next"):
             break
-        
+
         page += 1
         time.sleep(sleep_time)
-    
+
     print(f"\n  Total applications found: {len(all_apps)}\n")
     return all_apps
 
 
-def get_findings_for_app(session, app_guid, app_name, app_profile, filters, sleep_time=0.5):
-    """
-    Fetch all findings for a specific application using pagination.
-    Returns a list of finding objects.
-    """
+def get_sandboxes_for_app(session, app_guid, sleep_time=0.5):
+    """Returns all development sandboxes for an application."""
+    url = SANDBOXES_URL_TEMPLATE.format(app_guid=app_guid)
+
+    try:
+        resp = session.get(
+            url,
+            auth=RequestsAuthPluginVeracodeHMAC(),
+            timeout=60,
+        )
+
+        if resp.status_code == 404:
+            return []
+
+        if resp.status_code != 200:
+            print(f"    WARNING: Could not fetch sandboxes (status {resp.status_code})")
+            return []
+
+        data = resp.json()
+        sandboxes = data.get("_embedded", {}).get("sandboxes", [])
+        time.sleep(sleep_time)
+        return sandboxes
+
+    except Exception as e:
+        print(f"    WARNING: Error fetching sandboxes: {e}")
+        return []
+
+
+def get_findings_for_app(
+    session,
+    app_guid,
+    app_name,
+    app_profile,
+    filters,
+    sleep_time=0.5,
+    sandbox_guid=None,
+    sandbox_name=None,
+):
+    """Fetch all findings for an application (or sandbox) using pagination."""
     url = FINDINGS_URL_TEMPLATE.format(app_guid=app_guid)
     all_findings = []
     page = 0
-    
+
     params = {
         "page": page,
         "size": DEFAULT_PAGE_SIZE,
     }
-    
+
+    if sandbox_guid:
+        params["context"] = sandbox_guid
+
     if filters.get("scan_type"):
         params["scan_type"] = filters["scan_type"]
     if filters.get("severity") is not None:
@@ -141,10 +180,14 @@ def get_findings_for_app(session, app_guid, app_name, app_profile, filters, slee
         params["severity_gte"] = filters["severity_gte"]
     if filters.get("cwe"):
         params["cwe"] = filters["cwe"]
-    
+    if filters.get("status"):
+        params["status"] = filters["status"].upper()
+
+    context_label = f"sandbox '{sandbox_name}'" if sandbox_guid else "policy scan"
+
     while True:
         params["page"] = page
-        
+
         try:
             resp = session.get(
                 url,
@@ -152,47 +195,113 @@ def get_findings_for_app(session, app_guid, app_name, app_profile, filters, slee
                 auth=RequestsAuthPluginVeracodeHMAC(),
                 timeout=120,
             )
-            
+
             if resp.status_code == 404:
-                print(f"    No findings or app not found (404)")
+                print(f"    No findings or app not found (404) [{context_label}]")
                 break
-            
+
             if resp.status_code != 200:
-                print(f"    ERROR: Status {resp.status_code}")
+                print(f"    ERROR: Status {resp.status_code} [{context_label}]")
                 print(f"    Response: {resp.text}")
                 resp.raise_for_status()
-            
+
             data = resp.json()
-            
-            embedded = data.get("_embedded", {})
-            findings = embedded.get("findings", [])
-            
+            findings = data.get("_embedded", {}).get("findings", [])
+
             if not findings:
                 break
-            
+
             for finding in findings:
                 finding["_app_name"] = app_name
                 finding["_app_guid"] = app_guid
                 finding["_app_profile"] = app_profile
-            
+                finding["_sandbox_name"] = sandbox_name if sandbox_guid else None
+                finding["_sandbox_guid"] = sandbox_guid
+
             all_findings.extend(findings)
-            
+
             if page == 0:
-                print(f"    Page {page}: {len(findings)} findings")
+                print(f"    [{context_label}] Page {page}: {len(findings)} findings")
             else:
-                print(f"    Page {page}: {len(findings)} findings (Total: {len(all_findings)})")
-            
-            links = data.get("_links", {})
-            if not links.get("next"):
+                print(
+                    f"    [{context_label}] Page {page}: {len(findings)} findings "
+                    f"(Total so far: {len(all_findings)})"
+                )
+
+            if not data.get("_links", {}).get("next"):
                 break
-            
+
             page += 1
             time.sleep(sleep_time)
-            
+
         except Exception as e:
-            print(f"    ERROR fetching findings: {e}")
+            print(f"    ERROR fetching findings [{context_label}]: {e}")
             break
-    
+
+    return all_findings
+
+
+def get_all_findings_for_app(session, app_guid, app_name, app_profile, filters, sleep_time, include_sandboxes):
+    """
+    Fetches findings across policy scan and (optionally) all sandboxes.
+    SCA is always fetched in a dedicated separate pass per Veracode API requirements.
+    """
+    all_findings = []
+
+    requested_scan_types = filters.get("scan_type", "").upper().split(",") if filters.get("scan_type") else []
+    requested_scan_types = [s.strip() for s in requested_scan_types if s.strip()]
+
+    if requested_scan_types:
+        fetch_sca = "SCA" in requested_scan_types
+        fetch_non_sca = any(t in NON_SCA_SCAN_TYPES for t in requested_scan_types)
+        non_sca_types = [t for t in requested_scan_types if t in NON_SCA_SCAN_TYPES]
+    else:
+        fetch_sca = True
+        fetch_non_sca = True
+        non_sca_types = NON_SCA_SCAN_TYPES
+
+    def run_pass(scan_type_filter, context_guid=None, context_name=None):
+        pass_filters = dict(filters)
+        if scan_type_filter:
+            pass_filters["scan_type"] = scan_type_filter
+        else:
+            pass_filters.pop("scan_type", None)
+        return get_findings_for_app(
+            session=session,
+            app_guid=app_guid,
+            app_name=app_name,
+            app_profile=app_profile,
+            filters=pass_filters,
+            sleep_time=sleep_time,
+            sandbox_guid=context_guid,
+            sandbox_name=context_name,
+        )
+
+    if fetch_non_sca:
+        all_findings.extend(run_pass(",".join(non_sca_types)))
+
+    if fetch_sca:
+        all_findings.extend(run_pass("SCA", context_name="policy scan (SCA)"))
+
+    if include_sandboxes:
+        sandboxes = get_sandboxes_for_app(session, app_guid, sleep_time)
+
+        if sandboxes:
+            print(f"    Found {len(sandboxes)} sandbox(es), fetching findings for each...")
+
+        for sandbox in sandboxes:
+            sb_guid = sandbox.get("guid")
+            sb_name = sandbox.get("name", sb_guid)
+
+            if not sb_guid:
+                continue
+
+            if fetch_non_sca:
+                all_findings.extend(run_pass(",".join(non_sca_types), context_guid=sb_guid, context_name=sb_name))
+
+            if fetch_sca:
+                all_findings.extend(run_pass("SCA", context_guid=sb_guid, context_name=f"{sb_name} (SCA)"))
+
     return all_findings
 
 
@@ -200,29 +309,25 @@ def calculate_days_to_resolve(first_found, resolution_date):
     """Calculate days between first found and resolution date."""
     if not first_found or not resolution_date:
         return None
-    
     try:
         if isinstance(first_found, str):
-            first_found_dt = dt.datetime.fromisoformat(first_found.replace('Z', '+00:00'))
+            first_found_dt = dt.datetime.fromisoformat(first_found.replace("Z", "+00:00"))
         else:
             first_found_dt = first_found
-            
+
         if isinstance(resolution_date, str):
-            resolution_date_dt = dt.datetime.fromisoformat(resolution_date.replace('Z', '+00:00'))
+            resolution_date_dt = dt.datetime.fromisoformat(resolution_date.replace("Z", "+00:00"))
         else:
             resolution_date_dt = resolution_date
-        
-        delta = resolution_date_dt - first_found_dt
-        return delta.days
+
+        return (resolution_date_dt - first_found_dt).days
     except Exception:
         return None
 
 
 def extract_cwe_id(finding_details):
-    """Extract CWE ID from finding_details."""
     if not finding_details:
         return None
-    
     cwe = finding_details.get("cwe")
     if isinstance(cwe, dict):
         return cwe.get("id")
@@ -232,25 +337,17 @@ def extract_cwe_id(finding_details):
 
 
 def extract_cwe_name(finding_details):
-    """Extract CWE name/flaw name from finding_details."""
     if not finding_details:
         return None
-    
     cwe = finding_details.get("cwe")
     if isinstance(cwe, dict):
         return cwe.get("name")
-    
-    return (
-        finding_details.get("finding_category") or
-        finding_details.get("flaw_name")
-    )
+    return finding_details.get("finding_category") or finding_details.get("flaw_name")
 
 
 def extract_cve_id(finding_details):
-    """Extract CVE ID from finding_details (mainly for SCA)."""
     if not finding_details:
         return None
-    
     cve = finding_details.get("cve")
     if isinstance(cve, dict):
         return cve.get("name")
@@ -260,85 +357,75 @@ def extract_cve_id(finding_details):
 
 
 def extract_cvss(finding_details):
-    """Extract CVSS score from finding_details."""
     if not finding_details:
         return None
-    
     cve = finding_details.get("cve")
     if isinstance(cve, dict):
         cvss3 = cve.get("cvss3", {})
         if cvss3 and cvss3.get("score"):
             return cvss3.get("score")
         return cve.get("cvss")
-    
     return finding_details.get("cvss")
 
 
 def extract_filename(finding_details, scan_type):
-    """Extract filename/class/component based on scan type."""
     if not finding_details:
         return None
-    
     if scan_type == "STATIC":
         return finding_details.get("file_name") or finding_details.get("file_path")
-    
     elif scan_type == "DYNAMIC":
         return finding_details.get("path") or finding_details.get("URL")
-    
     elif scan_type == "MANUAL":
         return finding_details.get("location") or finding_details.get("module")
-    
     elif scan_type == "SCA":
         return finding_details.get("component_filename") or finding_details.get("version")
-    
     return None
 
 
 def normalize_finding(finding):
-    """
-    Extract and normalize required fields from a finding record.
-    """
+    """Extract and normalize required fields from a finding record."""
     app_name = finding.get("_app_name")
     app_guid = finding.get("_app_guid")
     app_profile = finding.get("_app_profile", {})
+    sandbox_name = finding.get("_sandbox_name")
     scan_type = finding.get("scan_type")
     description = finding.get("description")
-    
-    # Extract team name from business unit or teams array
+
+    # Prefer business unit name; fall back to first assigned team
     team_name = None
     business_unit = app_profile.get("business_unit")
     if isinstance(business_unit, dict):
         bu_name = business_unit.get("name")
         if bu_name and bu_name != "Not Specified":
             team_name = bu_name
-    
     if not team_name:
         teams = app_profile.get("teams", [])
         if isinstance(teams, list) and teams:
             first_team = teams[0]
             if isinstance(first_team, dict):
                 team_name = first_team.get("team_name")
-    
+
     finding_status_obj = finding.get("finding_status", {})
     first_found = finding_status_obj.get("first_found_date")
     status = finding_status_obj.get("status")
     resolution_status = finding_status_obj.get("resolution_status")
     resolution = finding_status_obj.get("resolution")
-    
+
     fixed_date = None
     if status == "CLOSED" or resolution_status == "FIXED":
-        fixed_date = finding_status_obj.get("last_seen_date")
-    
+        fixed_date = (
+            finding_status_obj.get("resolution_date")
+            or finding_status_obj.get("last_seen_date")
+        )
+
     finding_details = finding.get("finding_details", {})
-    
     cwe_id = extract_cwe_id(finding_details)
     flaw_name = extract_cwe_name(finding_details)
     cve_id = extract_cve_id(finding_details)
     cvss = extract_cvss(finding_details)
     filename = extract_filename(finding_details, scan_type)
-    
     severity = finding_details.get("severity")
-    
+
     custom_severity_map = {
         5: "Very High",
         4: "High",
@@ -348,14 +435,13 @@ def normalize_finding(finding):
         0: "Informational",
     }
     custom_severity = custom_severity_map.get(severity) if severity is not None else None
-    
     days_to_resolve = calculate_days_to_resolve(first_found, fixed_date)
-    
     vuln_title = description[:100] if description else None
-    
+
     return {
         "Application Name": app_name,
         "Application ID": app_guid,
+        "Sandbox Name": sandbox_name,
         "Custom Severity Name": custom_severity,
         "CVE ID": cve_id,
         "Description": description,
@@ -378,29 +464,32 @@ def normalize_finding(finding):
 
 def main():
     args = parse_args()
-    
-    # Print header banner
+
+    include_sandboxes = args.include_sandbox
+
     print("\n" + "=" * 70)
     print("  VERACODE FINDINGS API EXPORT")
     print("=" * 70)
-    print(f"  Output File: {args.output}")
+    print(f"  Output File      : {args.output}")
+    print(f"  Include Sandboxes: {include_sandboxes}")
     if args.app_name:
-        print(f"  Filter: Application Name = {args.app_name}")
+        print(f"  Filter App Name  : {args.app_name}")
     if args.app_guid:
-        print(f"  Filter: Application GUID = {args.app_guid}")
+        print(f"  Filter App GUID  : {args.app_guid}")
     if args.scan_type:
-        print(f"  Filter: Scan Type = {args.scan_type}")
+        print(f"  Filter Scan Type : {args.scan_type}")
     if args.severity is not None:
-        print(f"  Filter: Severity = {args.severity}")
+        print(f"  Filter Severity  : {args.severity}")
     if args.severity_gte is not None:
-        print(f"  Filter: Severity >= {args.severity_gte}")
+        print(f"  Filter Sev >=    : {args.severity_gte}")
     if args.cwe:
-        print(f"  Filter: CWE = {args.cwe}")
+        print(f"  Filter CWE       : {args.cwe}")
+    if args.status:
+        print(f"  Filter Status    : {args.status}")
     print("=" * 70 + "\n")
-    
+
     session = requests.Session()
-    
-    # Build filters
+
     filters = {}
     if args.scan_type:
         filters["scan_type"] = args.scan_type
@@ -410,80 +499,75 @@ def main():
         filters["severity_gte"] = args.severity_gte
     if args.cwe:
         filters["cwe"] = args.cwe
-    
-    # Step 1: Get applications
+    if args.status:
+        filters["status"] = args.status
+
     if args.app_guid:
-        # Single application by GUID
         applications = [{"guid": args.app_guid, "profile": {"name": "Unknown"}}]
         print(f"Processing single application: {args.app_guid}\n")
     else:
-        # Get all applications
         applications = get_applications(session, args.sleep)
-        
-        # Filter by app name if specified
+
         if args.app_name:
             applications = [
                 app for app in applications
                 if args.app_name.lower() in app.get("profile", {}).get("name", "").lower()
             ]
             print(f"Filtered to {len(applications)} applications matching '{args.app_name}'\n")
-        
-        # Limit number of apps if specified (for testing)
+
         if args.max_apps:
-            applications = applications[:args.max_apps]
+            applications = applications[: args.max_apps]
             print(f"Limited to {args.max_apps} applications (for testing)\n")
-    
-    # Step 2: Fetch findings for each application
+
     print("\n" + "=" * 70)
     print("  FETCHING FINDINGS FROM APPLICATIONS")
     print("=" * 70 + "\n")
-    
+
     all_findings = []
     apps_with_findings = 0
-    
+
     for idx, app in enumerate(applications, start=1):
         app_guid = app.get("guid")
         app_profile = app.get("profile", {})
         app_name = app_profile.get("name", "Unknown")
-        
+
         print(f"  [{idx}/{len(applications)}] {app_name}")
         print(f"    GUID: {app_guid}")
-        
-        findings = get_findings_for_app(
+
+        findings = get_all_findings_for_app(
             session=session,
             app_guid=app_guid,
             app_name=app_name,
             app_profile=app_profile,
             filters=filters,
             sleep_time=args.sleep,
+            include_sandboxes=include_sandboxes,
         )
-        
+
         if findings:
             all_findings.extend(findings)
             apps_with_findings += 1
-            print(f"    ✓ Total: {len(findings)} findings\n")
+            print(f"    ✓ Total findings for this app: {len(findings)}\n")
         else:
             print(f"    ✗ No findings\n")
-    
-    # Step 3: Save results
+
     print("\n" + "=" * 70)
     print("  SAVING RESULTS")
     print("=" * 70)
-    
-    # Save raw JSON for debugging
+
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     json_file = f"veracode_findings_api_raw_{timestamp}.json"
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump(all_findings, f, indent=2)
     print(f"  Raw JSON: {json_file} ({len(all_findings)} findings)")
-    
-    # Normalize and save to CSV
+
     if all_findings:
         normalized_findings = [normalize_finding(f) for f in all_findings]
-        
+
         fieldnames = [
             "Application Name",
             "Application ID",
+            "Sandbox Name",
             "Custom Severity Name",
             "CVE ID",
             "Description",
@@ -502,22 +586,22 @@ def main():
             "Resolution Status",
             "Resolution",
         ]
-        
+
         with open(args.output, "w", encoding="utf-8", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(normalized_findings)
-        
+
         print(f"  CSV File: {args.output} ({len(normalized_findings)} findings)")
     else:
         print("  No findings found with the specified filters.")
-    
+
     print("\n" + "=" * 70)
     print("  EXPORT COMPLETED")
     print("=" * 70)
-    print(f"  Applications processed: {len(applications)}")
+    print(f"  Applications processed    : {len(applications)}")
     print(f"  Applications with findings: {apps_with_findings}")
-    print(f"  Total findings: {len(all_findings)}")
+    print(f"  Total findings            : {len(all_findings)}")
     print("=" * 70 + "\n")
 
 
