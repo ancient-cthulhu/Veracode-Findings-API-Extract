@@ -15,7 +15,7 @@ FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/finding
 
 DEFAULT_PAGE_SIZE = 500
 
-# SCA must be fetched in a separate API call
+# SCA must be fetched in a separate API call; cannot be mixed with other scan types
 NON_SCA_SCAN_TYPES = ["STATIC", "DYNAMIC", "MANUAL"]
 
 
@@ -183,7 +183,12 @@ def get_findings_for_app(
     if filters.get("status"):
         params["status"] = filters["status"].upper()
 
-    context_label = f"sandbox '{sandbox_name}'" if sandbox_guid else "policy scan"
+    if sandbox_guid:
+        context_label = f"sandbox '{sandbox_name}'"
+    elif sandbox_name:
+        context_label = sandbox_name
+    else:
+        context_label = "policy scan"
 
     while True:
         params["page"] = page
