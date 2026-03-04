@@ -3,6 +3,8 @@ import datetime as dt
 import json
 import time
 import csv
+import re
+import html
 
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
@@ -15,8 +17,19 @@ FINDINGS_URL_TEMPLATE = f"{BASE_URL}/appsec/v2/applications/{{app_guid}}/finding
 
 DEFAULT_PAGE_SIZE = 500
 
-# SCA must be fetched in a separate API call
+# SCA must be fetched in a separate API call; cannot be mixed with other scan types
 NON_SCA_SCAN_TYPES = ["STATIC", "DYNAMIC", "MANUAL"]
+
+
+def strip_html(text):
+    """Remove HTML tags and unescape HTML entities from text."""
+    if not text:
+        return text
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    text = ' '.join(text.split())
+    return text
 
 
 def parse_args():
@@ -30,7 +43,7 @@ def parse_args():
     )
     parser.add_argument(
         "--app-name",
-        help="Filter by specific application name(s). Supports comma-separated values for multiple apps (optional).",
+        help="Filter by specific application name (optional).",
     )
     parser.add_argument(
         "--app-guid",
@@ -396,7 +409,6 @@ def normalize_finding(finding):
     scan_type = finding.get("scan_type")
     description = finding.get("description")
 
-    # Prefer business unit name; fall back to first assigned team
     team_name = None
     business_unit = app_profile.get("business_unit")
     if isinstance(business_unit, dict):
@@ -441,7 +453,18 @@ def normalize_finding(finding):
     }
     custom_severity = custom_severity_map.get(severity) if severity is not None else None
     days_to_resolve = calculate_days_to_resolve(first_found, fixed_date)
-    vuln_title = description[:100] if description else None
+    
+    clean_description = strip_html(description)
+    
+    if scan_type == "SCA":
+        # For SCA, use CVE ID or vulnerability name (these ARE vulnerabilities)
+        vuln_title = cve_id if cve_id else flaw_name
+    elif scan_type == "DYNAMIC" or scan_type == "MANUAL":
+        # DAST/Manual can be actual vulnerabilities
+        vuln_title = flaw_name
+    else:
+        # SAST and other types: leave vulnerability title empty (they have Flaw Name)
+        vuln_title = None
 
     return {
         "Application Name": app_name,
@@ -449,7 +472,7 @@ def normalize_finding(finding):
         "Sandbox Name": sandbox_name,
         "Custom Severity Name": custom_severity,
         "CVE ID": cve_id,
-        "Description": description,
+        "Description": clean_description,
         "Vulnerability Title": vuln_title,
         "CWE ID": cwe_id,
         "Flaw Name": flaw_name,
@@ -514,17 +537,11 @@ def main():
         applications = get_applications(session, args.sleep)
 
         if args.app_name:
-            # Parse comma-separated app names
-            target_app_names = [name.strip() for name in args.app_name.split(",")]
             applications = [
                 app for app in applications
-                if app.get("profile", {}).get("name", "") in target_app_names
+                if args.app_name.lower() in app.get("profile", {}).get("name", "").lower()
             ]
-            print(f"Filtered to {len(applications)} applications matching provided names\n")
-            if len(applications) < len(target_app_names):
-                found_names = {app.get("profile", {}).get("name", "") for app in applications}
-                missing_names = set(target_app_names) - found_names
-                print(f"WARNING: Could not find the following applications: {', '.join(missing_names)}\n")
+            print(f"Filtered to {len(applications)} applications matching '{args.app_name}'\n")
 
         if args.max_apps:
             applications = applications[: args.max_apps]
