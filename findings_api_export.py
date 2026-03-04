@@ -25,7 +25,6 @@ def strip_html(text):
     """Remove HTML tags and unescape HTML entities from text."""
     if not text:
         return text
-    # Remove HTML tags
     text = re.sub(r'<[^>]+>', '', text)
     text = html.unescape(text)
     text = ' '.join(text.split())
@@ -75,8 +74,7 @@ def parse_args():
         "--include-sandbox",
         action="store_true",
         default=False,
-        help="Also fetch findings from all development sandboxes. "
-             "By default only policy scan findings are returned.",
+        help="Also fetch findings from all sandboxes (default: policy scan only).",
     )
     parser.add_argument(
         "--sleep",
@@ -162,6 +160,68 @@ def get_sandboxes_for_app(session, app_guid, sleep_time=0.5):
         return []
 
 
+def get_sca_workspaces(session, sleep_time=0.5):
+    """Fetch all SCA workspaces and their projects for mapping agent-based findings."""
+    sca_api_base = "https://api.veracode.com/srcclr/v3"
+    workspace_project_map = {}
+    
+    try:
+        resp = session.get(
+            f"{sca_api_base}/workspaces",
+            auth=RequestsAuthPluginVeracodeHMAC(),
+            timeout=60,
+        )
+        
+        if resp.status_code != 200:
+            return workspace_project_map
+        
+        data = resp.json()
+        workspaces = data.get("_embedded", {}).get("workspaces", [])
+        
+        for workspace in workspaces:
+            workspace_id = workspace.get("id")
+            workspace_site_id = workspace.get("site_id")
+            
+            if not workspace_id:
+                continue
+            
+            projects_url = f"{sca_api_base}/workspaces/{workspace_id}/projects"
+            resp = session.get(
+                projects_url,
+                auth=RequestsAuthPluginVeracodeHMAC(),
+                timeout=60,
+            )
+            
+            if resp.status_code == 200:
+                projects_data = resp.json()
+                projects = projects_data.get("_embedded", {}).get("projects", [])
+                
+                for project in projects:
+                    project_site_id = project.get("site_id")
+                    project_name = project.get("name", "")
+                    linked_app = project.get("linked_application", {})
+                    linked_app_guid = linked_app.get("guid")
+                    
+                    if project_site_id and workspace_site_id:
+                        mapping = {
+                            "workspace_guid": workspace_site_id,
+                            "project_id": project_site_id,
+                            "project_name": project_name
+                        }
+                        
+                        workspace_project_map[project_name.lower()] = mapping
+                        
+                        if linked_app_guid:
+                            workspace_project_map[f"guid:{linked_app_guid}"] = mapping
+            
+            time.sleep(sleep_time)
+        
+    except Exception as e:
+        print(f"    WARNING: Could not fetch SCA workspaces: {e}")
+    
+    return workspace_project_map
+
+
 def get_findings_for_app(
     session,
     app_guid,
@@ -171,6 +231,8 @@ def get_findings_for_app(
     sleep_time=0.5,
     sandbox_guid=None,
     sandbox_name=None,
+    app_id=None,
+    app_oid=None,
 ):
     """Fetch all findings for an application (or sandbox) using pagination."""
     url = FINDINGS_URL_TEMPLATE.format(app_guid=app_guid)
@@ -235,6 +297,8 @@ def get_findings_for_app(
                 finding["_app_profile"] = app_profile
                 finding["_sandbox_name"] = sandbox_name if sandbox_guid else None
                 finding["_sandbox_guid"] = sandbox_guid
+                finding["_app_id"] = app_id
+                finding["_app_oid"] = app_oid
 
             all_findings.extend(findings)
 
@@ -259,11 +323,8 @@ def get_findings_for_app(
     return all_findings
 
 
-def get_all_findings_for_app(session, app_guid, app_name, app_profile, filters, sleep_time, include_sandboxes):
-    """
-    Fetches findings across policy scan and (optionally) all sandboxes.
-    SCA is always fetched in a dedicated separate pass per Veracode API requirements.
-    """
+def get_all_findings_for_app(session, app_guid, app_name, app_profile, filters, sleep_time, include_sandboxes, app_id=None, app_oid=None):
+    """Fetches findings across policy scan and (optionally) all sandboxes. SCA is fetched separately per API requirements."""
     all_findings = []
 
     requested_scan_types = filters.get("scan_type", "").upper().split(",") if filters.get("scan_type") else []
@@ -293,6 +354,8 @@ def get_all_findings_for_app(session, app_guid, app_name, app_profile, filters, 
             sleep_time=sleep_time,
             sandbox_guid=context_guid,
             sandbox_name=context_name,
+            app_id=app_id,
+            app_oid=app_oid,
         )
 
     if fetch_non_sca:
@@ -400,6 +463,95 @@ def extract_filename(finding_details, scan_type):
     return None
 
 
+def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=None, finding_obj=None, app_id=None, app_oid=None):
+    """Generate the appropriate Veracode platform link based on scan type."""
+    if not app_guid:
+        return None
+    
+    base_analysis_center = "https://analysiscenter.veracode.com/auth/index.jsp"
+    
+    if scan_type == "STATIC":
+        scan_params = None
+        
+        if finding_obj:
+            scan_params = finding_obj.get("_latest_scan_params")
+            
+            if not scan_params:
+                scan_params = finding_obj.get("_finding_scan_params")
+        
+        if scan_params and app_oid and app_id:
+            return f"{base_analysis_center}#ReviewResultsAllFlaws:{app_oid}:{app_id}:{scan_params}"
+        else:
+            build_id = None
+            if finding_obj:
+                build_id = finding_obj.get("build_id")
+            if not build_id and finding_details:
+                build_id = finding_details.get("build_id")
+            
+            if build_id and app_oid and app_id:
+                return f"{base_analysis_center}#ReviewResultsAllFlaws:{app_oid}:{app_id}:{build_id}"
+            elif app_oid and app_id:
+                return f"{base_analysis_center}#AnalyzeAppModuleList:{app_oid}:{app_id}:"
+            else:
+                if sandbox_guid:
+                    return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:{sandbox_guid}"
+                else:
+                    return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:"
+    
+    elif scan_type == "DYNAMIC":
+        if sandbox_guid:
+            return f"{base_analysis_center}#AnalyzeAppDynamicList:{app_guid}:{sandbox_guid}"
+        else:
+            return f"{base_analysis_center}#AnalyzeAppDynamicList:{app_guid}:"
+    
+    elif scan_type == "MANUAL":
+        if sandbox_guid:
+            return f"{base_analysis_center}#AnalyzeAppManualList:{app_guid}:{sandbox_guid}"
+        else:
+            return f"{base_analysis_center}#AnalyzeAppManualList:{app_guid}:"
+    
+    elif scan_type == "SCA":
+        if finding_details:
+            metadata = finding_details.get("metadata", {})
+            sca_scan_mode = metadata.get("sca_scan_mode", "").upper()
+            
+            if sca_scan_mode == "AGENT":
+                workspace_guid = (finding_details.get("workspace_guid") or 
+                                finding_details.get("workspace_id") or
+                                metadata.get("workspace_guid") or
+                                metadata.get("workspace_id"))
+                
+                project_id = (finding_details.get("project_id") or
+                            metadata.get("project_id"))
+                
+                if finding_obj:
+                    if not workspace_guid:
+                        workspace_guid = finding_obj.get("_sca_workspace_guid") or finding_obj.get("workspace_guid") or finding_obj.get("workspace_id")
+                    if not project_id:
+                        project_id = finding_obj.get("_sca_project_id") or finding_obj.get("project_id")
+                
+                if workspace_guid and project_id:
+                    return f"https://sca.analysiscenter.veracode.com/workspaces/{workspace_guid}/projects/{project_id}/issues"
+                else:
+                    return "https://sca.analysiscenter.veracode.com/workspaces"
+            
+            scan_params = None
+            if finding_obj:
+                scan_params = finding_obj.get("_latest_scan_params")
+            
+            if scan_params and app_oid and app_id:
+                return f"{base_analysis_center}#ReviewResultsSCA:{app_oid}:{app_id}:{scan_params}"
+            elif app_oid and app_id:
+                return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_oid}:{app_id}:"
+            else:
+                if sandbox_guid:
+                    return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_guid}:{sandbox_guid}"
+                else:
+                    return f"{base_analysis_center}#AnalyzeAppSourceComposition:{app_guid}:"
+    
+    return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:"
+
+
 def normalize_finding(finding):
     """Extract and normalize required fields from a finding record."""
     app_name = finding.get("_app_name")
@@ -407,7 +559,14 @@ def normalize_finding(finding):
     app_profile = finding.get("_app_profile", {})
     sandbox_name = finding.get("_sandbox_name")
     scan_type = finding.get("scan_type")
+    original_scan_type = scan_type
     description = finding.get("description")
+    
+    finding_details = finding.get("finding_details", {})
+    if scan_type == "SCA":
+        metadata = finding_details.get("metadata", {})
+        if metadata.get("sca_scan_mode") == "AGENT":
+            scan_type = "SCA Agent"
 
     team_name = None
     business_unit = app_profile.get("business_unit")
@@ -435,7 +594,6 @@ def normalize_finding(finding):
             or finding_status_obj.get("last_seen_date")
         )
 
-    finding_details = finding.get("finding_details", {})
     cwe_id = extract_cwe_id(finding_details)
     flaw_name = extract_cwe_name(finding_details)
     cve_id = extract_cve_id(finding_details)
@@ -454,21 +612,24 @@ def normalize_finding(finding):
     custom_severity = custom_severity_map.get(severity) if severity is not None else None
     days_to_resolve = calculate_days_to_resolve(first_found, fixed_date)
     
+    sandbox_guid = finding.get("_sandbox_guid")
+    app_id = finding.get("_app_id")
+    app_oid = finding.get("_app_oid")
+    veracode_link = generate_veracode_link(app_guid, original_scan_type, finding_details, sandbox_guid, finding_obj=finding, app_id=app_id, app_oid=app_oid)
+    
     clean_description = strip_html(description)
     
     if scan_type == "SCA":
-        # For SCA, use CVE ID or vulnerability name (these ARE vulnerabilities)
         vuln_title = cve_id if cve_id else flaw_name
     elif scan_type == "DYNAMIC" or scan_type == "MANUAL":
-        # DAST/Manual can be actual vulnerabilities
         vuln_title = flaw_name
     else:
-        # SAST and other types: leave vulnerability title empty (they have Flaw Name)
         vuln_title = None
 
     return {
         "Application Name": app_name,
         "Application ID": app_guid,
+        "Veracode Link": veracode_link,
         "Sandbox Name": sandbox_name,
         "Custom Severity Name": custom_severity,
         "CVE ID": cve_id,
@@ -518,6 +679,21 @@ def main():
 
     session = requests.Session()
 
+    # Fetch SCA workspace/project mappings for agent-based SCA links
+    print("\n" + "=" * 70)
+    print("  FETCHING SCA WORKSPACE MAPPINGS")
+    print("=" * 70)
+    sca_workspace_map = get_sca_workspaces(session, args.sleep)
+    if sca_workspace_map:
+        print(f"  Found {len(sca_workspace_map)} SCA projects")
+        # Show a few sample project names for debugging
+        sample_projects = list(sca_workspace_map.keys())[:5]
+        if sample_projects:
+            print(f"  Sample project names: {', '.join(sample_projects)}")
+    else:
+        print("  No SCA projects found or unable to fetch")
+    print("=" * 70 + "\n")
+
     filters = {}
     if args.scan_type:
         filters["scan_type"] = args.scan_type
@@ -531,8 +707,19 @@ def main():
         filters["status"] = args.status
 
     if args.app_guid:
-        applications = [{"guid": args.app_guid, "profile": {"name": "Unknown"}}]
-        print(f"Processing single application: {args.app_guid}\n")
+        # Fetch the specific application details
+        print(f"Fetching application details for GUID: {args.app_guid}\n")
+        resp = session.get(
+            f"{APPLICATIONS_URL}/{args.app_guid}",
+            auth=RequestsAuthPluginVeracodeHMAC(),
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            applications = [resp.json()]
+        else:
+            print(f"ERROR: Could not fetch application (status {resp.status_code})")
+            print(f"Response: {resp.text}")
+            return
     else:
         applications = get_applications(session, args.sleep)
 
@@ -558,6 +745,40 @@ def main():
         app_guid = app.get("guid")
         app_profile = app.get("profile", {})
         app_name = app_profile.get("name", "Unknown")
+        app_id = app.get("id")
+        app_oid = app.get("oid") or app.get("alt_org_id")
+        
+        # Map build_id to full scan parameters for accurate SAST linking
+        scan_params_by_build = {}
+        scans = app.get("scans", [])
+        for scan in scans:
+            if scan.get("scan_type") == "STATIC":
+                scan_url = scan.get("scan_url", "")
+                if scan_url:
+                    parts = scan_url.split(":")
+                    if len(parts) >= 4:
+                        try:
+                            scan_build_id = int(parts[3])
+                            full_params = ":".join(parts[3:])
+                            scan_params_by_build[scan_build_id] = full_params
+                        except (ValueError, IndexError):
+                            pass
+        
+        # Get latest STATIC scan params for SCA fallback
+        latest_static_build_id = None
+        latest_scan_params = None
+        for scan in scans:
+            if scan.get("scan_type") == "STATIC":
+                scan_url = scan.get("scan_url", "")
+                if scan_url:
+                    parts = scan_url.split(":")
+                    if len(parts) >= 4:
+                        try:
+                            latest_static_build_id = int(parts[3])
+                            latest_scan_params = ":".join(parts[3:])
+                            break
+                        except (ValueError, IndexError):
+                            pass
 
         print(f"  [{idx}/{len(applications)}] {app_name}")
         print(f"    GUID: {app_guid}")
@@ -570,7 +791,30 @@ def main():
             filters=filters,
             sleep_time=args.sleep,
             include_sandboxes=include_sandboxes,
+            app_id=app_id,
+            app_oid=app_oid,
         )
+        
+        for finding in findings:
+            finding["_latest_static_build_id"] = latest_static_build_id
+            finding["_latest_scan_params"] = latest_scan_params
+            finding["_scan_params_by_build"] = scan_params_by_build
+            
+            # For STATIC findings, lookup full params by build_id
+            if finding.get("scan_type") == "STATIC":
+                finding_build_id = finding.get("build_id")
+                if finding_build_id and finding_build_id in scan_params_by_build:
+                    finding["_finding_scan_params"] = scan_params_by_build[finding_build_id]
+
+            # Map agent-based SCA to workspace/project (exact GUID match only)
+            if finding.get("scan_type") == "SCA":
+                metadata = finding.get("finding_details", {}).get("metadata", {})
+                if metadata.get("sca_scan_mode") == "AGENT":
+                    guid_key = f"guid:{app_guid}"
+                    if guid_key in sca_workspace_map:
+                        mapping = sca_workspace_map[guid_key]
+                        finding["_sca_workspace_guid"] = mapping["workspace_guid"]
+                        finding["_sca_project_id"] = mapping["project_id"]
 
         if findings:
             all_findings.extend(findings)
@@ -595,6 +839,7 @@ def main():
         fieldnames = [
             "Application Name",
             "Application ID",
+            "Veracode Link",
             "Sandbox Name",
             "Custom Severity Name",
             "CVE ID",
