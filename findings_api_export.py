@@ -222,6 +222,67 @@ def get_sca_workspaces(session, sleep_time=0.5):
     return workspace_project_map
 
 
+def get_dynamic_analyses(session, sleep_time=0.5):
+    """Fetch all Dynamic Analysis analyses for mapping Dynamic findings."""
+    dynamic_analyses_map = {}
+    
+    try:
+        resp = session.get(
+            "https://api.veracode.com/was/configservice/v1/analyses",
+            params={"size": 500},
+            auth=RequestsAuthPluginVeracodeHMAC(),
+            timeout=60,
+        )
+        
+        if resp.status_code != 200:
+            return dynamic_analyses_map
+        
+        data = resp.json()
+        analyses = data.get("_embedded", {}).get("analyses", [])
+        
+        for analysis in analyses:
+            analysis_id = analysis.get("analysis_id")
+            analysis_name = analysis.get("name")
+            
+            if not analysis_id:
+                continue
+            
+            # Fetch scans for this analysis to get linked app info
+            scans_url = f"https://api.veracode.com/was/configservice/v1/analyses/{analysis_id}/scans"
+            resp_scans = session.get(
+                scans_url,
+                auth=RequestsAuthPluginVeracodeHMAC(),
+                timeout=60,
+            )
+            
+            if resp_scans.status_code == 200:
+                scans_data = resp_scans.json()
+                scans = scans_data.get("_embedded", {}).get("scans", [])
+                
+                for scan in scans:
+                    linked_app_guid = scan.get("linked_platform_app_uuid")
+                    
+                    if linked_app_guid:
+                        # Store Dynamic Analysis info mapped by app GUID
+                        if linked_app_guid not in dynamic_analyses_map:
+                            dynamic_analyses_map[linked_app_guid] = []
+                        
+                        dynamic_analyses_map[linked_app_guid].append({
+                            "analysis_id": analysis_id,
+                            "analysis_name": analysis_name,
+                            "scan_id": scan.get("scan_id"),
+                            "scan_type": analysis.get("scan_type"),
+                            "latest_occurrence_id": analysis.get("latest_occurrence_id"),
+                        })
+            
+            time.sleep(sleep_time)
+        
+    except Exception as e:
+        print(f"    WARNING: Could not fetch Dynamic Analysis analyses: {e}")
+    
+    return dynamic_analyses_map
+
+
 def get_findings_for_app(
     session,
     app_guid,
@@ -499,6 +560,25 @@ def generate_veracode_link(app_guid, scan_type, finding_details, sandbox_guid=No
                     return f"{base_analysis_center}#AnalyzeAppModuleList:{app_guid}:"
     
     elif scan_type == "DYNAMIC":
+        # Check if this is a Dynamic Analysis scan
+        da_analysis_id = None
+        if finding_obj:
+            da_analysis_id = finding_obj.get("_da_analysis_id")
+
+        # Dynamic Analysis scans page
+        if da_analysis_id:
+            return f"https://web.analysiscenter.veracode.com/was/#/analysis/{da_analysis_id}/scans"
+
+        # Check for DAST scan URL
+        dynamic_scan_url = None
+        if finding_obj:
+            dynamic_scan_url = finding_obj.get("_dynamic_scan_url")
+
+        if dynamic_scan_url:
+            # Use DAST link format
+            return f"{base_analysis_center}#{dynamic_scan_url}"
+
+        # Fallback to dynamic analysis list view
         if sandbox_guid:
             return f"{base_analysis_center}#AnalyzeAppDynamicList:{app_guid}:{sandbox_guid}"
         else:
@@ -567,6 +647,12 @@ def normalize_finding(finding):
         metadata = finding_details.get("metadata", {})
         if metadata.get("sca_scan_mode") == "AGENT":
             scan_type = "SCA Agent"
+    elif scan_type == "DYNAMIC":
+        # Differentiate between Dynamic Analysis and DAST
+        if finding.get("_da_analysis_id"):
+            scan_type = "Dynamic Analysis"
+        elif finding.get("_dynamic_scan_url"):
+            scan_type = "DAST"
 
     team_name = None
     business_unit = app_profile.get("business_unit")
@@ -694,6 +780,18 @@ def main():
         print("  No SCA projects found or unable to fetch")
     print("=" * 70 + "\n")
 
+    # Fetch Dynamic Analysis analyses for linking
+    print("\n" + "=" * 70)
+    print("  FETCHING DYNAMIC ANALYSIS MAPPINGS")
+    print("=" * 70)
+    dynamic_analyses_map = get_dynamic_analyses(session, args.sleep)
+    if dynamic_analyses_map:
+        total_analyses = sum(len(analyses) for analyses in dynamic_analyses_map.values())
+        print(f"  Found {total_analyses} Dynamic Analysis analyses across {len(dynamic_analyses_map)} applications")
+    else:
+        print("  No Dynamic Analysis analyses found or unable to fetch")
+    print("=" * 70 + "\n")
+
     filters = {}
     if args.scan_type:
         filters["scan_type"] = args.scan_type
@@ -750,10 +848,14 @@ def main():
         
         # Map build_id to full scan parameters for accurate SAST linking
         scan_params_by_build = {}
+        dynamic_scan_params_by_build = {}
         scans = app.get("scans", [])
         for scan in scans:
+            scan_url = scan.get("scan_url", "")
+            if not scan_url:
+                continue
+                
             if scan.get("scan_type") == "STATIC":
-                scan_url = scan.get("scan_url", "")
                 if scan_url:
                     parts = scan_url.split(":")
                     if len(parts) >= 4:
@@ -761,6 +863,18 @@ def main():
                             scan_build_id = int(parts[3])
                             full_params = ":".join(parts[3:])
                             scan_params_by_build[scan_build_id] = full_params
+                        except (ValueError, IndexError):
+                            pass
+            
+            elif scan.get("scan_type") == "DYNAMIC":
+                # Parse DAST scan URL format: DynamicParamsView:oid:app_id:build_id:unknown::scan_id
+                if scan_url.startswith("DynamicParamsView:"):
+                    parts = scan_url.split(":")
+                    if len(parts) >= 4:
+                        try:
+                            scan_build_id = int(parts[3])
+                            # Store the full scan URL for DAST
+                            dynamic_scan_params_by_build[scan_build_id] = scan_url
                         except (ValueError, IndexError):
                             pass
         
@@ -799,12 +913,19 @@ def main():
             finding["_latest_static_build_id"] = latest_static_build_id
             finding["_latest_scan_params"] = latest_scan_params
             finding["_scan_params_by_build"] = scan_params_by_build
+            finding["_dynamic_scan_params_by_build"] = dynamic_scan_params_by_build
             
             # For STATIC findings, lookup full params by build_id
             if finding.get("scan_type") == "STATIC":
                 finding_build_id = finding.get("build_id")
                 if finding_build_id and finding_build_id in scan_params_by_build:
                     finding["_finding_scan_params"] = scan_params_by_build[finding_build_id]
+            
+            # For DYNAMIC findings, lookup DAST scan URL by build_id
+            elif finding.get("scan_type") == "DYNAMIC":
+                finding_build_id = finding.get("build_id")
+                if finding_build_id and finding_build_id in dynamic_scan_params_by_build:
+                    finding["_dynamic_scan_url"] = dynamic_scan_params_by_build[finding_build_id]
 
             # Map agent-based SCA to workspace/project (exact GUID match only)
             if finding.get("scan_type") == "SCA":
@@ -815,6 +936,19 @@ def main():
                         mapping = sca_workspace_map[guid_key]
                         finding["_sca_workspace_guid"] = mapping["workspace_guid"]
                         finding["_sca_project_id"] = mapping["project_id"]
+            
+            # Map Dynamic findings to Dynamic Analysis
+            if finding.get("scan_type") == "DYNAMIC":
+                if app_guid in dynamic_analyses_map:
+                    da_analyses = dynamic_analyses_map[app_guid]
+                    if da_analyses:
+                        # Use the first/latest analysis for this app
+                        da_info = da_analyses[0]
+                        finding["_da_analysis_id"] = da_info.get("analysis_id")
+                        finding["_da_analysis_name"] = da_info.get("analysis_name")
+                        finding["_da_scan_id"] = da_info.get("scan_id")
+                        finding["_da_scan_type"] = da_info.get("scan_type")
+                        finding["_da_occurrence_id"] = da_info.get("latest_occurrence_id")
 
         if findings:
             all_findings.extend(findings)
