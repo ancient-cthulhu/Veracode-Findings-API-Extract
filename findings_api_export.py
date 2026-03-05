@@ -598,7 +598,7 @@ def normalize_finding(finding):
     flaw_name = extract_cwe_name(finding_details)
     cve_id = extract_cve_id(finding_details)
     cvss = extract_cvss(finding_details)
-    filename = extract_filename(finding_details, scan_type)
+    filename = extract_filename(finding_details, original_scan_type)
     severity = finding_details.get("severity")
 
     custom_severity_map = {
