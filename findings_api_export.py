@@ -22,9 +22,20 @@ NON_SCA_SCAN_TYPES = ["STATIC", "DYNAMIC", "MANUAL"]
 
 
 def strip_html(text):
-    """Remove HTML tags and unescape HTML entities from text."""
+    """Remove HTML tags and unescape HTML entities from text. Also decodes base64 if needed."""
     if not text:
         return text
+    
+    import base64
+    if len(text) > 50 and all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=' for c in text):
+        try:
+            # Try to decode as base64
+            decoded = base64.b64decode(text).decode('utf-8')
+            text = decoded
+        except Exception:
+            pass
+    
+    # Remove HTML tags
     text = re.sub(r'<[^>]+>', '', text)
     text = html.unescape(text)
     text = ' '.join(text.split())
